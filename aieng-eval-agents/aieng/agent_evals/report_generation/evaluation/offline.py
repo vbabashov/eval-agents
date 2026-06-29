@@ -11,6 +11,7 @@ Example
 """
 
 import logging
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -96,7 +97,12 @@ async def evaluate(
         name="Evaluate Report Generation Agent",
         description="Evaluate the Report Generation Agent with data from Langfuse",
         task=report_generation_task.run,
-        evaluators=[final_result_evaluator, trajectory_evaluator],
+        evaluators=[
+            final_result_evaluator,
+            trajectory_evaluator,
+            report_data_match_grader,
+            report_schema_grader,
+        ],
         max_concurrency=max_concurrency,
     )
 
@@ -331,6 +337,208 @@ def _get_additional_instructions(expected_output: EvaluationOutput, key: str) ->
         return additional_instructions_dict.get(key, "")
 
     return ""
+
+
+def _normalize_cell(value: Any) -> Any:
+    """Normalize a single report cell for deterministic comparison.
+
+    Empty values (``None`` or ``""``) are coerced to ``0`` so that valid
+    placeholder values (e.g. the first row of a month-over-month change report)
+    do not cause spurious mismatches. Numeric values are rounded to two decimal
+    places to match the ±0.01 tolerance used by the LLM-as-a-judge evaluator.
+
+    Parameters
+    ----------
+    value : Any
+        The raw cell value from the report data.
+
+    Returns
+    -------
+    Any
+        The normalized cell value.
+    """
+    if value is None or value == "":
+        return 0
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return round(float(value), 2)
+    return value
+
+
+def _normalize_rows(report_data: Any) -> list[tuple[Any, ...]] | None:
+    """Normalize report rows into a comparable, order-independent form.
+
+    Parameters
+    ----------
+    report_data : Any
+        The ``report_data`` field from a report (a 2D array of values), or
+        anything else if the report is malformed.
+
+    Returns
+    -------
+    list[tuple[Any, ...]] | None
+        A sorted list of normalized row tuples, or ``None`` if ``report_data``
+        is not a list of rows.
+    """
+    if not isinstance(report_data, list):
+        return None
+
+    normalized: list[tuple[Any, ...]] = []
+    for row in report_data:
+        if not isinstance(row, (list, tuple)):
+            return None
+        normalized.append(tuple(_normalize_cell(cell) for cell in row))
+
+    # Sort so that row order does not affect the comparison. Use the string
+    # representation as the key to tolerate mixed types within a column.
+    return sorted(normalized, key=lambda r: tuple(str(cell) for cell in r))
+
+
+def report_data_match_grader(
+    *,
+    input: str,  # noqa: A002
+    output: EvaluationOutput,
+    expected_output: EvaluationOutput,
+    **kwargs: Any,
+) -> list[Evaluation]:
+    """Deterministically compare report data against the ground truth.
+
+    This is a pure-code counterpart to :func:`final_result_evaluator`. It checks
+    that the agent's report data matches the expected data, ignoring row order
+    and applying a ±0.01 numeric tolerance. Empty placeholder cells (``None`` or
+    ``""``) are treated as ``0``.
+
+    Parameters
+    ----------
+    input : str
+        The input to the report generation agent (unused, kept for the
+        evaluator interface).
+    output : EvaluationOutput
+        The output of the report generation agent.
+    expected_output : EvaluationOutput
+        The ground-truth evaluation output.
+    kwargs : dict
+        Additional keyword arguments.
+
+    Returns
+    -------
+    list[Evaluation]
+        ``Data Exact Match`` (boolean), ``Row Count Match`` (boolean) and
+        ``Row Overlap`` (numeric fraction of expected rows that were matched).
+    """
+    actual_report = output.get("final_report")
+    expected_report = expected_output.get("final_report")
+
+    actual_rows = _normalize_rows(actual_report.get("report_data")) if isinstance(actual_report, dict) else None
+    expected_rows = _normalize_rows(expected_report.get("report_data")) if isinstance(expected_report, dict) else None
+
+    if expected_rows is None:
+        comment = "Expected report data is missing or malformed."
+        return [
+            Evaluation(name="Data Exact Match", value=False, comment=comment),
+            Evaluation(name="Row Count Match", value=False, comment=comment),
+            Evaluation(name="Row Overlap", value=0.0, comment=comment),
+        ]
+
+    if actual_rows is None:
+        comment = "Agent produced no valid report data (no `write_xlsx` call or malformed data)."
+        return [
+            Evaluation(name="Data Exact Match", value=False, comment=comment),
+            Evaluation(name="Row Count Match", value=False, comment=comment),
+            Evaluation(name="Row Overlap", value=0.0, comment=comment),
+        ]
+
+    row_count_match = len(actual_rows) == len(expected_rows)
+
+    # Compare as multisets so duplicate rows are accounted for correctly.
+    actual_remaining = Counter(actual_rows)
+    matched = 0
+    for row in expected_rows:
+        if actual_remaining.get(row, 0) > 0:
+            actual_remaining[row] -= 1
+            matched += 1
+
+    exact_match = matched == len(expected_rows) and row_count_match
+    row_overlap = matched / len(expected_rows) if expected_rows else 0.0
+
+    return [
+        Evaluation(
+            name="Data Exact Match",
+            value=exact_match,
+            comment=f"Matched {matched}/{len(expected_rows)} expected rows (order-insensitive, ±0.01 tolerance).",
+        ),
+        Evaluation(
+            name="Row Count Match",
+            value=row_count_match,
+            comment=f"Got {len(actual_rows)} rows, expected {len(expected_rows)}.",
+        ),
+        Evaluation(
+            name="Row Overlap",
+            value=row_overlap,
+            comment=f"{matched}/{len(expected_rows)} expected rows present in the agent's report.",
+        ),
+    ]
+
+
+def report_schema_grader(
+    *,
+    input: str,  # noqa: A002
+    output: EvaluationOutput,
+    expected_output: EvaluationOutput,
+    **kwargs: Any,
+) -> list[Evaluation]:
+    """Deterministically check the report's structural properties.
+
+    Verifies that the number of report columns matches the ground truth and that
+    the output filename is a valid ``.xlsx`` file. This is a cheap, pure-code
+    complement to the LLM-as-a-judge evaluators.
+
+    Parameters
+    ----------
+    input : str
+        The input to the report generation agent (unused, kept for the
+        evaluator interface).
+    output : EvaluationOutput
+        The output of the report generation agent.
+    expected_output : EvaluationOutput
+        The ground-truth evaluation output.
+    kwargs : dict
+        Additional keyword arguments.
+
+    Returns
+    -------
+    list[Evaluation]
+        ``Column Count Match`` (boolean) and ``Valid Filename`` (boolean).
+    """
+    actual_report = output.get("final_report")
+    expected_report = expected_output.get("final_report")
+
+    if not isinstance(actual_report, dict):
+        comment = "Agent produced no report (no `write_xlsx` call)."
+        return [
+            Evaluation(name="Column Count Match", value=False, comment=comment),
+            Evaluation(name="Valid Filename", value=False, comment=comment),
+        ]
+
+    actual_columns = actual_report.get("report_columns")
+    expected_columns = expected_report.get("report_columns") if isinstance(expected_report, dict) else None
+
+    if isinstance(actual_columns, list) and isinstance(expected_columns, list):
+        column_count_match = len(actual_columns) == len(expected_columns)
+        column_comment = f"Got {len(actual_columns)} columns, expected {len(expected_columns)}."
+    else:
+        column_count_match = False
+        column_comment = "Report columns missing or malformed in the agent's output or the ground truth."
+
+    filename = actual_report.get("filename")
+    valid_filename = isinstance(filename, str) and filename.strip().lower().endswith(".xlsx")
+    filename_comment = f"Filename is '{filename}'." if valid_filename else f"Filename '{filename}' is not a valid .xlsx file."
+
+    return [
+        Evaluation(name="Column Count Match", value=column_count_match, comment=column_comment),
+        Evaluation(name="Valid Filename", value=valid_filename, comment=filename_comment),
+    ]
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential())
